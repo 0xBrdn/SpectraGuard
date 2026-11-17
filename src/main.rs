@@ -1,8 +1,4 @@
-mod api;
-mod dsp;
-mod error;
-mod ids;
-mod sdr;
+use spectraguard::{api, dsp, error, ids, sdr};
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

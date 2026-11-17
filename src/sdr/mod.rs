@@ -45,6 +45,7 @@ impl BandPreset {
 }
 
 /// Passive RF receiver interface yielding normalized baseband IQ chunks.
+#[allow(async_fn_in_trait)]
 pub trait RfSource {
     async fn next_chunk(&mut self) -> Result<IqChunk, SpectraError>;
     fn center_freq_hz(&self) -> u64;

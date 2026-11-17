@@ -234,8 +234,21 @@ impl WidsEngine {
         };
 
         let delta_db = spectrum.noise_floor_dbfs - baseline;
+        let bins_above_baseline_pct = if spectrum.bins_dbfs.is_empty() {
+            0.0
+        } else {
+            let thresh = baseline + self.config.broadband_delta_db;
+            let count = spectrum
+                .bins_dbfs
+                .iter()
+                .filter(|&&b| b >= thresh)
+                .count();
+            (count as f32 / spectrum.bins_dbfs.len() as f32) * 100.0
+        };
+        let effective_occupancy_pct = spectrum.channel_occupancy_pct.max(bins_above_baseline_pct);
+
         let condition_met = delta_db >= self.config.broadband_delta_db
-            && spectrum.channel_occupancy_pct >= self.config.broadband_min_occupancy_pct;
+            && effective_occupancy_pct >= self.config.broadband_min_occupancy_pct;
 
         if !condition_met {
             self.broadband_onset_ns = None;
@@ -251,7 +264,7 @@ impl WidsEngine {
         self.last_broadband_seen_ns = spectrum.timestamp_ns;
         let confidence_pct = (70.0
             + (delta_db - self.config.broadband_delta_db).max(0.0) * 1.5
-            + (spectrum.channel_occupancy_pct - self.config.broadband_min_occupancy_pct).max(0.0)
+            + (effective_occupancy_pct - self.config.broadband_min_occupancy_pct).max(0.0)
                 * 0.4)
             .clamp(70.0, 99.9);
 
@@ -273,8 +286,8 @@ impl WidsEngine {
                     alert
                         .evidence
                         .channel_occupancy_pct
-                        .map_or(spectrum.channel_occupancy_pct, |prev| {
-                            prev.max(spectrum.channel_occupancy_pct)
+                        .map_or(effective_occupancy_pct, |prev| {
+                            prev.max(effective_occupancy_pct)
                         }),
                 );
                 alert.evidence.duration_us = Some(elapsed_ms.saturating_mul(1_000));
@@ -297,14 +310,14 @@ impl WidsEngine {
             category: AlertCategory::BroadbandJamming,
             title: format!(
                 "Broadband RF Jamming (+{:.1} dB noise floor, {:.1}% occupancy)",
-                delta_db, spectrum.channel_occupancy_pct
+                delta_db, effective_occupancy_pct
             ),
             center_freq_hz: spectrum.center_freq_hz,
             snr_db: delta_db,
             confidence_pct,
             evidence: AlertEvidence {
                 noise_floor_delta_db: Some(delta_db),
-                channel_occupancy_pct: Some(spectrum.channel_occupancy_pct),
+                channel_occupancy_pct: Some(effective_occupancy_pct),
                 duration_us: Some(elapsed_ms.saturating_mul(1_000)),
                 deviation_details: Some(format!(
                     "Noise floor {:.1} dBFS vs baseline {:.1} dBFS",
