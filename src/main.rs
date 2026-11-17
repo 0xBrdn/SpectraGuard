@@ -1,18 +1,17 @@
+mod dsp;
 mod error;
 mod sdr;
 
-use std::f32::consts::TAU;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use num_complex::Complex;
-use rustfft::FftPlanner;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
+use crate::dsp::{BurstDetector, BurstDetectorConfig, SpectrumAnalyzer, SpectrumConfig};
 use crate::error::SpectraError;
 use crate::sdr::sigmf::{SigMfAnnotation, SigMfDatatype, SigMfReader, SigMfWriter};
 use crate::sdr::simulator::{Scenario, SimulatedRfSource, SimulatorConfig, ThreatCommand};
@@ -102,45 +101,6 @@ impl RfSource for ActiveSource {
     }
 }
 
-fn measure_psd_dbfs(
-    samples: &[Complex<f32>],
-    window: &[f32],
-    fft: &std::sync::Arc<dyn rustfft::Fft<f32>>,
-    scratch: &mut [Complex<f32>],
-) -> (f32, f32) {
-    let fft_size = window.len();
-    if samples.len() < fft_size || fft_size == 0 {
-        return (-120.0, -120.0);
-    }
-
-    let window_sum: f32 = window.iter().sum();
-    let norm_factor = if window_sum > 0.0 {
-        window_sum
-    } else {
-        fft_size as f32
-    };
-
-    let mut buffer: Vec<Complex<f32>> = samples[..fft_size]
-        .iter()
-        .zip(window.iter())
-        .map(|(sample, coeff)| *sample * *coeff)
-        .collect();
-
-    fft.process_with_scratch(&mut buffer, scratch);
-
-    let mut powers_dbfs = Vec::with_capacity(fft_size);
-    for bin in &buffer {
-        let mag = bin.norm() / norm_factor;
-        let db = 20.0 * mag.max(1e-12).log10();
-        powers_dbfs.push(db);
-    }
-
-    powers_dbfs.sort_by(|a, b| a.total_cmp(b));
-    let noise_floor_dbfs = powers_dbfs[fft_size / 2];
-    let peak_power_dbfs = powers_dbfs[fft_size - 1];
-    (noise_floor_dbfs, peak_power_dbfs)
-}
-
 async fn run_monitor(
     source_kind: SourceKind,
     file: Option<PathBuf>,
@@ -149,13 +109,14 @@ async fn run_monitor(
     fft_size: usize,
     bind: SocketAddr,
 ) -> Result<()> {
-    if fft_size < 64 || !fft_size.is_power_of_two() {
-        return Err(SpectraError::InvalidDspConfig(format!(
-            "fft_size {} must be a power of two >= 64",
-            fft_size
-        ))
-        .into());
-    }
+    let mut analyzer = SpectrumAnalyzer::new(SpectrumConfig {
+        fft_size,
+        ..SpectrumConfig::default()
+    })?;
+    let mut burst_detector = BurstDetector::new(BurstDetectorConfig {
+        fft_size,
+        ..BurstDetectorConfig::default()
+    })?;
 
     let band_preset = BandPreset::from_cli_value(band)?;
     let target_freq_hz = band_preset.center_freq_hz();
@@ -226,13 +187,6 @@ async fn run_monitor(
         }
     });
 
-    let mut planner = FftPlanner::<f32>::new();
-    let fft = planner.plan_fft_forward(fft_size);
-    let mut scratch = vec![Complex::new(0.0, 0.0); fft.get_inplace_scratch_len()];
-    let window: Vec<f32> = (0..fft_size)
-        .map(|i| 0.5 * (1.0 - (TAU * i as f32 / fft_size as f32).cos()))
-        .collect();
-
     let mut chunk_count = 0u64;
     loop {
         tokio::select! {
@@ -243,16 +197,30 @@ async fn run_monitor(
             maybe_chunk = rx.recv() => {
                 let chunk = maybe_chunk.ok_or(SpectraError::ChannelClosed)??;
                 chunk_count += 1;
-                if chunk_count % 25 == 0 {
-                    let (noise_floor_dbfs, peak_power_dbfs) =
-                        measure_psd_dbfs(&chunk.samples, &window, &fft, &mut scratch);
+
+                let spectrum = analyzer.analyze_chunk(&chunk)?;
+                let bursts = burst_detector.process_chunk(&chunk, spectrum.noise_floor_dbfs)?;
+
+                for burst in &bursts {
+                    info!(
+                        burst_id = burst.id,
+                        duration_us = burst.duration_us,
+                        offset_hz = format_args!("{:.1}", burst.center_offset_hz),
+                        peak_snr_db = format_args!("{:.1}", burst.peak_snr_db),
+                        rssi_dbfs = format_args!("{:.1}", burst.mean_rssi_dbfs),
+                        modulation = ?burst.modulation_hint,
+                        baud_rate = burst.estimated_baud_rate,
+                        bitstream_hex = %burst.bitstream_hex,
+                        "burst detected"
+                    );
+                }
+
+                if chunk_count % 30 == 0 {
                     info!(
                         chunk = chunk_count,
-                        center_freq_hz = chunk.center_freq_hz,
-                        timestamp_ns = chunk.timestamp_ns,
-                        noise_floor_dbfs = format_args!("{noise_floor_dbfs:.2}"),
-                        peak_power_dbfs = format_args!("{peak_power_dbfs:.2}"),
-                        "baseband PSD telemetry"
+                        noise_floor_dbfs = format_args!("{:.2}", spectrum.noise_floor_dbfs),
+                        channel_occupancy_pct = format_args!("{:.2}", spectrum.channel_occupancy_pct),
+                        "spectrum frame telemetry"
                     );
                 }
             }
