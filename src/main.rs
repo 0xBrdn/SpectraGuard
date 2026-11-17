@@ -1,3 +1,4 @@
+mod api;
 mod dsp;
 mod error;
 mod ids;
@@ -5,13 +6,20 @@ mod sdr;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tokio::net::TcpListener;
+use tokio::sync::{broadcast, mpsc, watch};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
+use crate::api::{
+    ApiState, PipelineCommand, RuntimeMetadata, TelemetryEvent, build_router,
+    decimate_spectrum_frame,
+};
 use crate::dsp::{BurstDetector, BurstDetectorConfig, SpectrumAnalyzer, SpectrumConfig};
 use crate::error::SpectraError;
 use crate::ids::{AlertSeverity, DeviceBaselineProfile, WidsEngine, WidsRuleConfig};
@@ -34,6 +42,15 @@ struct Cli {
 enum SourceKind {
     Sim,
     Sigmf,
+}
+
+impl SourceKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sim => "sim",
+            Self::Sigmf => "sigmf",
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -119,17 +136,15 @@ async fn run_monitor(
         fft_size,
         ..BurstDetectorConfig::default()
     })?;
-    let mut wids_engine = WidsEngine::new(
-        WidsRuleConfig::default(),
-        DeviceBaselineProfile::default_industrial_profiles(),
-    )?;
-    let _wids_state = wids_engine.shared_state();
+    let initial_profiles = DeviceBaselineProfile::default_industrial_profiles();
+    let mut wids_engine = WidsEngine::new(WidsRuleConfig::default(), initial_profiles.clone())?;
+    let wids_state = wids_engine.shared_state();
 
     let band_preset = BandPreset::from_cli_value(band)?;
     let target_freq_hz = band_preset.center_freq_hz();
-    let chunk_size = fft_size * 16;
+    let chunk_size = analyzer.fft_size() * 16;
 
-    let (mut source, _threat_tx) = match source_kind {
+    let (mut source, threat_tx) = match source_kind {
         SourceKind::Sim => {
             let sim_config = SimulatorConfig {
                 reference_fft_size: fft_size,
@@ -175,78 +190,153 @@ async fn run_monitor(
         }
     };
 
-    info!(
-        center_freq_hz = source.center_freq_hz(),
-        sample_rate_hz = source.sample_rate_hz(),
-        fft_size,
-        bind_addr = %bind,
-        "SpectraGuard passive monitor initialized"
-    );
+    let runtime = Arc::new(RwLock::new(RuntimeMetadata {
+        source_mode: source_kind.as_str().to_string(),
+        center_freq_hz: source.center_freq_hz(),
+        sample_rate_hz: source.sample_rate_hz(),
+        fft_size: analyzer.fft_size(),
+        started_at: Instant::now(),
+        baselines: initial_profiles,
+    }));
 
-    let (tx, mut rx) = mpsc::channel::<Result<IqChunk, SpectraError>>(16);
-    tokio::spawn(async move {
+    let (telemetry_tx, _) = broadcast::channel::<TelemetryEvent>(256);
+    let (pipeline_cmd_tx, mut pipeline_cmd_rx) = mpsc::channel::<PipelineCommand>(32);
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+
+    let api_state = ApiState {
+        wids_state,
+        runtime,
+        telemetry_tx: telemetry_tx.clone(),
+        pipeline_cmd_tx,
+        threat_tx,
+    };
+
+    let pipeline_handle = tokio::spawn(async move {
+        let mut last_spectrum_broadcast = Instant::now() - Duration::from_millis(50);
+        let spectrum_interval = Duration::from_millis(40);
+        let mut chunk_count = 0u64;
+
         loop {
-            let item = source.next_chunk().await;
-            let is_err = item.is_err();
-            if tx.send(item).await.is_err() || is_err {
+            if *shutdown_rx.borrow() {
                 break;
             }
-        }
-    });
 
-    let mut chunk_count = 0u64;
-    loop {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                info!(processed_chunks = chunk_count, "shutdown signal received");
-                break;
-            }
-            maybe_chunk = rx.recv() => {
-                let chunk = maybe_chunk.ok_or(SpectraError::ChannelClosed)??;
-                chunk_count += 1;
-
-                let spectrum = analyzer.analyze_chunk(&chunk)?;
-                let bursts = burst_detector.process_chunk(&chunk, spectrum.noise_floor_dbfs)?;
-                let alerts = wids_engine.process_frame(&spectrum, &bursts);
-
-                for burst in &bursts {
-                    info!(
-                        burst_id = burst.id,
-                        duration_us = burst.duration_us,
-                        offset_hz = format_args!("{:.1}", burst.center_offset_hz),
-                        peak_snr_db = format_args!("{:.1}", burst.peak_snr_db),
-                        modulation = ?burst.modulation_hint,
-                        baud_rate = burst.estimated_baud_rate,
-                        "burst detected"
-                    );
-                }
-
-                for alert in &alerts {
-                    if alert.severity == AlertSeverity::Critical {
-                        warn!(
-                            alert_id = alert.id,
-                            category = ?alert.category,
-                            occurrences = alert.occurrence_count,
-                            confidence_pct = format_args!("{:.1}", alert.confidence_pct),
-                            title = %alert.title,
-                            "WIDS CRITICAL ALERT"
-                        );
-                    } else {
-                        warn!(
-                            alert_id = alert.id,
-                            severity = ?alert.severity,
-                            category = ?alert.category,
-                            occurrences = alert.occurrence_count,
-                            confidence_pct = format_args!("{:.1}", alert.confidence_pct),
-                            title = %alert.title,
-                            "WIDS alert"
-                        );
+            while let Ok(cmd) = pipeline_cmd_rx.try_recv() {
+                match cmd {
+                    PipelineCommand::SetCenterFreq(freq_hz) => {
+                        if let Err(err) = source.set_center_freq(freq_hz) {
+                            warn!(freq_hz, error = %err, "failed to retune RF source");
+                        } else {
+                            analyzer.reset_max_hold();
+                            wids_engine.reset_baseline();
+                            info!(center_freq_hz = freq_hz, "RF center frequency updated");
+                        }
+                    }
+                    PipelineCommand::AddBaseline(profile) => {
+                        info!(profile_name = %profile.name, "added authorized device baseline");
+                        wids_engine.add_profile(profile);
                     }
                 }
             }
-        }
-    }
 
+            let chunk = tokio::select! {
+                _ = shutdown_rx.changed() => break,
+                res = source.next_chunk() => match res {
+                    Ok(chunk) => chunk,
+                    Err(err) => {
+                        error!(error = %err, "RF source stream terminated");
+                        break;
+                    }
+                }
+            };
+
+            chunk_count += 1;
+            let spectrum = match analyzer.analyze_chunk(&chunk) {
+                Ok(frame) => frame,
+                Err(err) => {
+                    error!(error = %err, "PSD analysis error");
+                    break;
+                }
+            };
+            let bursts = match burst_detector.process_chunk(&chunk, spectrum.noise_floor_dbfs) {
+                Ok(detected) => detected,
+                Err(err) => {
+                    error!(error = %err, "burst detector error");
+                    break;
+                }
+            };
+            let alerts = wids_engine.process_frame(&spectrum, &bursts);
+
+            if last_spectrum_broadcast.elapsed() >= spectrum_interval {
+                last_spectrum_broadcast = Instant::now();
+                let decimated = decimate_spectrum_frame(&spectrum, 512);
+                let _ = telemetry_tx.send(TelemetryEvent::Spectrum(decimated));
+            }
+
+            for burst in bursts {
+                info!(
+                    burst_id = burst.id,
+                    duration_us = burst.duration_us,
+                    offset_hz = format_args!("{:.1}", burst.center_offset_hz),
+                    peak_snr_db = format_args!("{:.1}", burst.peak_snr_db),
+                    modulation = ?burst.modulation_hint,
+                    baud_rate = burst.estimated_baud_rate,
+                    "burst detected"
+                );
+                let _ = telemetry_tx.send(TelemetryEvent::Burst(burst));
+            }
+
+            for alert in alerts {
+                if alert.severity == AlertSeverity::Critical {
+                    warn!(
+                        alert_id = alert.id,
+                        category = ?alert.category,
+                        occurrences = alert.occurrence_count,
+                        confidence_pct = format_args!("{:.1}", alert.confidence_pct),
+                        title = %alert.title,
+                        "WIDS CRITICAL ALERT"
+                    );
+                } else {
+                    warn!(
+                        alert_id = alert.id,
+                        severity = ?alert.severity,
+                        category = ?alert.category,
+                        occurrences = alert.occurrence_count,
+                        confidence_pct = format_args!("{:.1}", alert.confidence_pct),
+                        title = %alert.title,
+                        "WIDS alert"
+                    );
+                }
+                let _ = telemetry_tx.send(TelemetryEvent::Alert(alert));
+            }
+        }
+
+        info!(processed_chunks = chunk_count, "DSP/WIDS pipeline stopped");
+    });
+
+    let router = build_router(api_state);
+    let listener = TcpListener::bind(bind)
+        .await
+        .with_context(|| format!("failed to bind HTTP/WebSocket server on {bind}"))?;
+
+    info!(
+        center_freq_hz = target_freq_hz,
+        sample_rate_hz,
+        fft_size,
+        bind_addr = %bind,
+        "SpectraGuard HTTP/WebSocket telemetry server listening"
+    );
+
+    axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            info!("shutdown signal received");
+            let _ = shutdown_tx.send(true);
+        })
+        .await
+        .context("HTTP server terminated with error")?;
+
+    let _ = pipeline_handle.await;
     Ok(())
 }
 

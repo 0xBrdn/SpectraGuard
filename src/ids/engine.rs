@@ -117,6 +117,25 @@ impl WidsEngine {
         Arc::clone(&self.shared_state)
     }
 
+    pub fn reset_baseline(&mut self) {
+        self.baseline_noise_floor_dbfs = None;
+        self.broadband_onset_ns = None;
+        self.active_broadband_alert_id = None;
+        self.active_narrowband.clear();
+        self.active_rogues.clear();
+        self.active_duty_cycle_alert_id = None;
+        self.replay_window.clear();
+        self.duty_cycle_window.clear();
+        if let Ok(mut guard) = self.shared_state.write() {
+            guard.baseline_noise_floor_dbfs = -92.0;
+            guard.latest_spectrum = None;
+        }
+    }
+
+    pub fn add_profile(&mut self, profile: DeviceBaselineProfile) {
+        self.profiles.push(profile);
+    }
+
     pub fn process_frame(
         &mut self,
         spectrum: &SpectrumFrame,
@@ -461,7 +480,8 @@ impl WidsEngine {
                 let dur_sim = (1.0 - dur_diff_ratio).clamp(0.0, 1.0);
                 let freq_sim =
                     (1.0 - (freq_diff / self.config.replay_freq_tolerance_hz)).clamp(0.0, 1.0);
-                let max_baud = burst.estimated_baud_rate.max(candidate.estimated_baud_rate).max(1) as f32;
+                let max_baud =
+                    burst.estimated_baud_rate.max(candidate.estimated_baud_rate).max(1) as f32;
                 let baud_sim = (1.0
                     - ((burst.estimated_baud_rate as f32 - candidate.estimated_baud_rate as f32)
                         .abs()
