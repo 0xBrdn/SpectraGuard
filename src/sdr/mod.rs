@@ -1,5 +1,5 @@
 pub mod sigmf;
-pub mod sim;
+pub mod simulator;
 
 use num_complex::Complex;
 

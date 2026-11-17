@@ -15,7 +15,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::error::SpectraError;
 use crate::sdr::sigmf::{SigMfAnnotation, SigMfDatatype, SigMfReader, SigMfWriter};
-use crate::sdr::sim::{Scenario, SimulatedRfSource};
+use crate::sdr::simulator::{Scenario, SimulatedRfSource, SimulatorConfig, ThreatCommand};
 use crate::sdr::{BandPreset, IqChunk, RfSource};
 
 #[derive(Debug, Parser)]
@@ -114,7 +114,11 @@ fn measure_psd_dbfs(
     }
 
     let window_sum: f32 = window.iter().sum();
-    let norm_factor = if window_sum > 0.0 { window_sum } else { fft_size as f32 };
+    let norm_factor = if window_sum > 0.0 {
+        window_sum
+    } else {
+        fft_size as f32
+    };
 
     let mut buffer: Vec<Complex<f32>> = samples[..fft_size]
         .iter()
@@ -157,14 +161,21 @@ async fn run_monitor(
     let target_freq_hz = band_preset.center_freq_hz();
     let chunk_size = fft_size * 16;
 
-    let mut source = match source_kind {
-        SourceKind::Sim => ActiveSource::Sim(SimulatedRfSource::new(
-            target_freq_hz,
-            sample_rate_hz,
-            chunk_size,
-            Scenario::Clean,
-            true,
-        )?),
+    let (mut source, _threat_tx) = match source_kind {
+        SourceKind::Sim => {
+            let sim_config = SimulatorConfig {
+                reference_fft_size: fft_size,
+                ..SimulatorConfig::default()
+            };
+            let (sim, tx) = SimulatedRfSource::new(
+                target_freq_hz,
+                sample_rate_hz,
+                chunk_size,
+                sim_config,
+                true,
+            )?;
+            (ActiveSource::Sim(sim), Some(tx))
+        }
         SourceKind::Sigmf => {
             let path = file.ok_or_else(|| {
                 SpectraError::InvalidSigMfMetadata(
@@ -184,10 +195,15 @@ async fn run_monitor(
             }
             info!(
                 sigmf_version = %reader.metadata().global.version,
-                description = reader.metadata().global.description.as_deref().unwrap_or("none"),
+                description = reader
+                    .metadata()
+                    .global
+                    .description
+                    .as_deref()
+                    .unwrap_or("none"),
                 "loaded SigMF capture"
             );
-            ActiveSource::Sigmf(reader)
+            (ActiveSource::Sigmf(reader), None)
         }
     };
 
@@ -266,11 +282,11 @@ async fn run_generate_sigmf(
     let total_samples = duration_sec.saturating_mul(sample_rate_hz as u64);
     let chunk_size = 32_768usize;
 
-    let mut sim = SimulatedRfSource::new(
+    let (mut sim, threat_tx) = SimulatedRfSource::new(
         center_freq_hz,
         sample_rate_hz,
         chunk_size,
-        scenario,
+        SimulatorConfig::default(),
         false,
     )?;
 
@@ -287,23 +303,91 @@ async fn run_generate_sigmf(
         Some(description),
     )?;
 
+    let trigger_sample = total_samples / 4;
+    let secondary_trigger_sample = (total_samples * 3) / 5;
+    let mut primary_injected = false;
+    let mut secondary_injected = false;
+
     while writer.written_samples() < total_samples {
+        let written = writer.written_samples();
+
+        if !primary_injected && written >= trigger_sample {
+            primary_injected = true;
+            match scenario {
+                Scenario::Clean => {}
+                Scenario::Jamming => {
+                    let jam_ms = ((duration_sec * 1000) / 4).clamp(250, 2_500);
+                    let _ = threat_tx.try_send(ThreatCommand::InjectBroadbandJammer {
+                        duration_ms: jam_ms,
+                        power_offset_db: 24.0,
+                    });
+                    let half_bw_hz = (sample_rate_hz as f64) * 0.425;
+                    writer.add_annotation(SigMfAnnotation {
+                        sample_start: written,
+                        sample_count: (jam_ms * sample_rate_hz as u64) / 1000,
+                        freq_lower_edge_hz: Some(center_freq_hz as f64 - half_bw_hz),
+                        freq_upper_edge_hz: Some(center_freq_hz as f64 + half_bw_hz),
+                        label: Some("broadband_jammer".to_string()),
+                        comment: Some("Injected +24 dB wideband noise jammer".to_string()),
+                    });
+                }
+                Scenario::Replay => {
+                    let _ = threat_tx.try_send(ThreatCommand::InjectReplayAttack {
+                        repeat_count: 5,
+                        interval_ms: 45,
+                    });
+                    writer.add_annotation(SigMfAnnotation {
+                        sample_start: written,
+                        sample_count: (sample_rate_hz as u64) / 2,
+                        freq_lower_edge_hz: Some(center_freq_hz as f64 - 400_000.0),
+                        freq_upper_edge_hz: Some(center_freq_hz as f64 + 520_000.0),
+                        label: Some("replay_attack".to_string()),
+                        comment: Some("Injected bit-identical burst replay sequence".to_string()),
+                    });
+                }
+                Scenario::Rogue => {
+                    let rogue_ms = ((duration_sec * 1000) / 3).clamp(300, 3_000);
+                    let offset_hz = -140_000.0_f32;
+                    let _ = threat_tx.try_send(ThreatCommand::InjectRogueTransmitter {
+                        freq_offset_hz: offset_hz,
+                        baud_rate: 12_500,
+                        duration_ms: rogue_ms,
+                    });
+                    writer.add_annotation(SigMfAnnotation {
+                        sample_start: written,
+                        sample_count: (rogue_ms * sample_rate_hz as u64) / 1000,
+                        freq_lower_edge_hz: Some(center_freq_hz as f64 + offset_hz as f64 - 25_000.0),
+                        freq_upper_edge_hz: Some(center_freq_hz as f64 + offset_hz as f64 + 25_000.0),
+                        label: Some("rogue_transmitter".to_string()),
+                        comment: Some("Unauthorized OOK burst on unallocated offset".to_string()),
+                    });
+                }
+            }
+        }
+
+        if !secondary_injected && written >= secondary_trigger_sample && scenario == Scenario::Jamming {
+            secondary_injected = true;
+            let nb_ms = ((duration_sec * 1000) / 4).clamp(250, 2_500);
+            let offset_hz = 120_000.0_f32;
+            let _ = threat_tx.try_send(ThreatCommand::InjectNarrowbandJammer {
+                freq_offset_hz: offset_hz,
+                duration_ms: nb_ms,
+                power_db: -14.0,
+            });
+            writer.add_annotation(SigMfAnnotation {
+                sample_start: written,
+                sample_count: (nb_ms * sample_rate_hz as u64) / 1000,
+                freq_lower_edge_hz: Some(center_freq_hz as f64 + offset_hz as f64 - 15_000.0),
+                freq_upper_edge_hz: Some(center_freq_hz as f64 + offset_hz as f64 + 15_000.0),
+                label: Some("narrowband_jammer".to_string()),
+                comment: Some("Injected narrowband CW/FM channel jammer".to_string()),
+            });
+        }
+
         let chunk = sim.next_chunk().await?;
         let remaining = (total_samples - writer.written_samples()) as usize;
         let slice_len = remaining.min(chunk.samples.len());
         writer.write_samples(&chunk.samples[..slice_len])?;
-    }
-
-    if scenario != Scenario::Clean {
-        let half_bw_hz = (sample_rate_hz as f64) * 0.25;
-        writer.add_annotation(SigMfAnnotation {
-            sample_start: 0,
-            sample_count: writer.written_samples(),
-            freq_lower_edge_hz: Some(center_freq_hz as f64 - half_bw_hz),
-            freq_upper_edge_hz: Some(center_freq_hz as f64 + half_bw_hz),
-            label: Some(scenario.as_str().to_string()),
-            comment: Some(format!("Synthetic {} PHY anomaly profile", scenario.as_str())),
-        });
     }
 
     let written_samples = writer.written_samples();
