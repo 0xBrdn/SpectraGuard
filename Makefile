@@ -31,4 +31,4 @@ gen-samples:
 
 clean:
 	$(CARGO) clean
-	rm -rf $(UI_DIR)/dist $(CAPTURES_DIR)/*.sigmf-data$(CAPTURES_DIR)/*.sigmf-meta
+	rm -rf $(UI_DIR)/dist $(CAPTURES_DIR)/*.sigmf-data$ (CAPTURES_DIR)/*.sigmf-meta

@@ -1,5 +1,6 @@
 /target/
 .DS_Store
+/captures/
 *.sigmf-data
 *.sigmf-meta
 /ui/node_modules/
