@@ -83,6 +83,7 @@ pub enum TelemetryEvent {
 pub enum PipelineCommand {
     SetCenterFreq(u64),
     AddBaseline(DeviceBaselineProfile),
+    ResetMaxHold,
 }
 
 /// Mutable runtime configuration shared between the DSP task and REST handlers.
@@ -273,6 +274,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/ws/telemetry", get(ws_telemetry_handler))
         .route("/api/v1/status", get(get_status))
         .route("/api/v1/config/band", post(post_config_band))
+        .route("/api/v1/spectrum/reset-hold", post(post_spectrum_reset_hold))
         .route("/api/v1/sim/inject", post(post_sim_inject))
         .route("/api/v1/alerts", get(get_alerts))
         .route("/api/v1/alerts/clear", post(post_alerts_clear))
@@ -280,6 +282,23 @@ pub fn build_router(state: ApiState) -> Router {
         .fallback(static_asset_fallback)
         .layer(CorsLayer::permissive())
         .with_state(state)
+}
+
+async fn post_spectrum_reset_hold(State(state): State<ApiState>) -> Response {
+    if state
+        .pipeline_cmd_tx
+        .send(PipelineCommand::ResetMaxHold)
+        .await
+        .is_err()
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "DSP pipeline command channel closed" })),
+        )
+            .into_response();
+    }
+
+    (StatusCode::OK, Json(json!({ "status": "reset" }))).into_response()
 }
 
 async fn ws_telemetry_handler(

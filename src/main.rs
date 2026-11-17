@@ -236,6 +236,9 @@ async fn run_monitor(
                         info!(profile_name = %profile.name, "added authorized device baseline");
                         wids_engine.add_profile(profile);
                     }
+                    PipelineCommand::ResetMaxHold => {
+                        analyzer.reset_max_hold();
+                    }
                 }
             }
 

@@ -2,3 +2,5 @@
 .DS_Store
 *.sigmf-data
 *.sigmf-meta
+/ui/node_modules/
+/ui/dist/
