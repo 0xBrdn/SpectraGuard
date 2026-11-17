@@ -1,5 +1,6 @@
 mod dsp;
 mod error;
+mod ids;
 mod sdr;
 
 use std::net::SocketAddr;
@@ -13,6 +14,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::dsp::{BurstDetector, BurstDetectorConfig, SpectrumAnalyzer, SpectrumConfig};
 use crate::error::SpectraError;
+use crate::ids::{AlertSeverity, DeviceBaselineProfile, WidsEngine, WidsRuleConfig};
 use crate::sdr::sigmf::{SigMfAnnotation, SigMfDatatype, SigMfReader, SigMfWriter};
 use crate::sdr::simulator::{Scenario, SimulatedRfSource, SimulatorConfig, ThreatCommand};
 use crate::sdr::{BandPreset, IqChunk, RfSource};
@@ -117,6 +119,11 @@ async fn run_monitor(
         fft_size,
         ..BurstDetectorConfig::default()
     })?;
+    let mut wids_engine = WidsEngine::new(
+        WidsRuleConfig::default(),
+        DeviceBaselineProfile::default_industrial_profiles(),
+    )?;
+    let _wids_state = wids_engine.shared_state();
 
     let band_preset = BandPreset::from_cli_value(band)?;
     let target_freq_hz = band_preset.center_freq_hz();
@@ -200,6 +207,7 @@ async fn run_monitor(
 
                 let spectrum = analyzer.analyze_chunk(&chunk)?;
                 let bursts = burst_detector.process_chunk(&chunk, spectrum.noise_floor_dbfs)?;
+                let alerts = wids_engine.process_frame(&spectrum, &bursts);
 
                 for burst in &bursts {
                     info!(
@@ -207,21 +215,33 @@ async fn run_monitor(
                         duration_us = burst.duration_us,
                         offset_hz = format_args!("{:.1}", burst.center_offset_hz),
                         peak_snr_db = format_args!("{:.1}", burst.peak_snr_db),
-                        rssi_dbfs = format_args!("{:.1}", burst.mean_rssi_dbfs),
                         modulation = ?burst.modulation_hint,
                         baud_rate = burst.estimated_baud_rate,
-                        bitstream_hex = %burst.bitstream_hex,
                         "burst detected"
                     );
                 }
 
-                if chunk_count % 30 == 0 {
-                    info!(
-                        chunk = chunk_count,
-                        noise_floor_dbfs = format_args!("{:.2}", spectrum.noise_floor_dbfs),
-                        channel_occupancy_pct = format_args!("{:.2}", spectrum.channel_occupancy_pct),
-                        "spectrum frame telemetry"
-                    );
+                for alert in &alerts {
+                    if alert.severity == AlertSeverity::Critical {
+                        warn!(
+                            alert_id = alert.id,
+                            category = ?alert.category,
+                            occurrences = alert.occurrence_count,
+                            confidence_pct = format_args!("{:.1}", alert.confidence_pct),
+                            title = %alert.title,
+                            "WIDS CRITICAL ALERT"
+                        );
+                    } else {
+                        warn!(
+                            alert_id = alert.id,
+                            severity = ?alert.severity,
+                            category = ?alert.category,
+                            occurrences = alert.occurrence_count,
+                            confidence_pct = format_args!("{:.1}", alert.confidence_pct),
+                            title = %alert.title,
+                            "WIDS alert"
+                        );
+                    }
                 }
             }
         }
